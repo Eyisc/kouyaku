@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https://api.openai.com; media-src 'self' blob: mediastream:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#f5f3ee" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e1116" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="口譯">
+<meta name="format-detection" content="telephone=no">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="styles.css">
+<title>口譯</title>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="bar">
+    <img class="brand-icon" src="icon-192.png" alt="口譯">
+    <nav class="modes" aria-label="模式">
+      <button type="button" class="mode" data-mode="talk" aria-pressed="true">對話</button>
+      <button type="button" class="mode" data-mode="listen" aria-pressed="false">聆聽</button>
+    </nav>
+    <button type="button" id="status" class="status" aria-live="polite">未連線</button>
+    <button type="button" id="openSettings" class="iconbtn" aria-label="設定">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>
+    </button>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden>
+    <div class="banner-row"><strong class="msg"></strong><button type="button" class="banner-x" aria-label="關閉">✕</button></div>
+    <p class="detail" hidden></p>
+  </div>
+
+  <main id="feed" class="feed">
+    <section id="empty" class="empty">
+      <article class="card phrase">
+        <header class="card-head"><span class="who">先給對方看</span></header>
+        <p class="dst" lang="ja" id="introText">すみません、翻訳アプリを使っています。このスマホに向かって、ゆっくり話していただけますか。</p>
+        <p class="src" id="introZh">不好意思，我在用翻譯 App，可以請你對著手機慢慢說嗎？</p>
+        <footer class="card-actions">
+          <button type="button" class="chip" data-intro="zoom">放大給對方看</button>
+          <button type="button" class="chip" data-intro="say">唸給對方聽</button>
+        </footer>
+      </article>
+      <ol class="howto">
+        <li>下方切換語言：<b>中⇄日</b>、<b>中⇄英</b>、<b>英⇄日</b>。</li>
+        <li>按 <b>我說</b>：講<span data-myword>中文</span>，翻成<span data-theirword>日文</span>並唸出來。</li>
+        <li>按 <b>對方說</b>：對方講<span data-theirword>日文</span>，翻成<span data-myword>中文</span>。</li>
+        <li>講完停一下會自動停止，也可以再按一次停止。</li>
+        <li>閒置 <span data-idle>2</span> 分鐘自動斷線，不會一直計費。</li>
+        <li>聽導覽或廣播時切到 <b>聆聽</b>，會一直翻下去。</li>
+      </ol>
+    </section>
+  </main>
+
+  <div class="pairbar">
+    <div class="seg pairs" role="group" aria-label="語言組合">
+      <button type="button" data-pair="zh-ja">中⇄日</button>
+      <button type="button" data-pair="zh-en">中⇄英</button>
+      <button type="button" data-pair="en-ja">英⇄日</button>
+    </div>
+    <button type="button" class="intro" id="introChip" data-intro="zoom">請對方慢慢說</button>
+  </div>
+
+  <footer id="talkControls" class="controls">
+    <button type="button" class="talk mine" data-dir="mine" aria-pressed="false">
+      <span class="t1">我說</span><span class="t2" data-label="mine">中文 → 日本語</span><span class="hint"></span><span class="lvl"><i></i></span>
+    </button>
+    <button type="button" class="talk theirs" data-dir="theirs" aria-pressed="false">
+      <span class="t1">對方說</span><span class="t2" data-label="theirs">日本語 → 中文</span><span class="hint"></span><span class="lvl"><i></i></span>
+    </button>
+  </footer>
+
+  <footer id="listenControls" class="controls" hidden>
+    <label class="switch listen-switch"><span>唸出翻譯（建議戴耳機）</span><input type="checkbox" id="listenSpeak"></label>
+    <button type="button" class="talk listen" data-dir="listen" aria-pressed="false">
+      <span class="t1">開始聆聽</span><span class="t2" data-label="listen">日本語 → English</span><span class="hint"></span><span class="lvl"><i></i></span>
+    </button>
+  </footer>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<div id="big" class="big" role="dialog" aria-modal="true" aria-label="放大顯示" hidden>
+  <div class="big-stage">
+    <p class="big-text" id="bigText"></p>
+    <p class="big-sub" id="bigSub"></p>
+  </div>
+  <div class="big-actions">
+    <button type="button" id="bigFlip">翻轉 180°</button>
+    <button type="button" id="bigReply" class="primary">換對方說</button>
+    <button type="button" id="bigClose">關閉</button>
+  </div>
+</div>
+
+<div id="setup" class="sheet" role="dialog" aria-modal="true" aria-labelledby="setupTitle" hidden>
+  <div class="sheet-body">
+    <h2 id="setupTitle">第一次使用：貼上 OpenAI API 金鑰</h2>
+    <ol class="steps">
+      <li>到 <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com/api-keys</a> 建立一把金鑰（帳號要先儲值）。</li>
+      <li>建議另開一個專案給這個 App，並設定每月預算上限。</li>
+      <li>把 <code>sk-</code> 開頭的金鑰貼到下面。</li>
+    </ol>
+    <input id="setupKey" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="sk-…">
+    <button type="button" id="setupSave" class="btn wide">儲存並測試</button>
+    <p id="setupMsg" class="msgline" role="status"></p>
+    <p class="muted small">金鑰只存在這支手機裡，只會送到 api.openai.com。</p>
+    <button type="button" id="setupLater" class="btn ghost wide">先看看介面</button>
+  </div>
+</div>
+
+<div id="settings" class="sheet" role="dialog" aria-modal="true" aria-labelledby="setTitle" hidden>
+  <div class="sheet-body">
+    <div class="sheet-head"><h2 id="setTitle">設定</h2><button type="button" class="btn ghost" data-close="settings">完成</button></div>
+
+    <h3>OpenAI API 金鑰</h3>
+    <div class="group">
+      <p id="keyState">尚未設定</p>
+      <input id="keyInput" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="貼上新的 sk-… 金鑰">
+      <div class="row">
+        <button type="button" id="keySave" class="btn">儲存並測試</button>
+        <button type="button" id="keyTest" class="btn ghost">測試連線</button>
+      </div>
+      <p id="keyMsg" class="msgline" role="status"></p>
+      <button type="button" id="keyDelete" class="btn ghost danger">刪除這支手機上的金鑰</button>
+    </div>
+
+    <h3>語言組合</h3>
+    <div class="group">
+      <div class="seg pairs" role="group" aria-label="語言組合">
+        <button type="button" data-pair="zh-ja">中文⇄日文</button>
+        <button type="button" data-pair="zh-en">中文⇄英文</button>
+        <button type="button" data-pair="en-ja">英文⇄日文</button>
+      </div>
+      <p class="muted small">左邊是我的語言，右邊是對方的語言。「我說」翻成對方的語言，「對方說」翻成我的語言。講話的語言會自動辨認，中英混著講也可以。中文字幕會先試繁體，OpenAI 不接受時改用一般中文（可能是簡體字）。</p>
+    </div>
+
+    <h3>聲音與字幕</h3>
+    <div class="group">
+      <label class="switch"><span>唸出日文翻譯（給對方聽）</span><input type="checkbox" data-setting="speakJa"></label>
+      <label class="switch"><span>唸出對方的翻譯（給我聽）</span><input type="checkbox" data-setting="speakMine"></label>
+      <label class="switch"><span>顯示原文字幕</span><input type="checkbox" data-setting="showSource"></label>
+      <p class="muted small">原文字幕用另一個模型（gpt-realtime-whisper），可能另計約 US$0.017／分鐘。</p>
+    </div>
+
+    <h3>收音</h3>
+    <div class="group">
+      <div class="seg" data-setting="micType"><button type="button" data-v="near_field">手機拿近講</button><button type="button" data-v="far_field">手機放桌上</button></div>
+      <p class="muted small">講完停頓多久自動停止</p>
+      <div class="seg" data-setting="silenceMs"><button type="button" data-v="900">0.9 秒</button><button type="button" data-v="1200">1.2 秒</button><button type="button" data-v="1800">1.8 秒</button></div>
+    </div>
+
+    <h3>費用</h3>
+    <div class="group">
+      <p class="muted small">閒置多久自動斷線</p>
+      <div class="seg" data-setting="idleMin"><button type="button" data-v="1">1 分鐘</button><button type="button" data-v="2">2 分鐘</button><button type="button" data-v="5">5 分鐘</button></div>
+      <p id="usageText" class="small"></p>
+      <div class="row">
+        <button type="button" id="usageReset" class="btn ghost">重設統計</button>
+        <button type="button" id="historyClear" class="btn ghost danger">清除對話紀錄</button>
+      </div>
+    </div>
+
+    <h3>診斷</h3>
+    <div class="group">
+      <pre id="diag" class="diag"></pre>
+      <button type="button" id="diagCopy" class="btn ghost">複製診斷資訊</button>
+    </div>
+    <p class="muted small center" id="versionLine"></p>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
