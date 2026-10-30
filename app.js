@@ -7,7 +7,19 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.2.0';
+  // During an update a cached older page can meet this newer script: reload once to get the new page.
+  if (!document.getElementById('phraseView') || !document.getElementById('typer')) {
+    try {
+      if (!sessionStorage.getItem('ky.reloaded')) {
+        sessionStorage.setItem('ky.reloaded', '1');
+        setTimeout(() => location.reload(), 800);
+      }
+    } catch (e) { /* ignore */ }
+    return;
+  }
+  try { sessionStorage.removeItem('ky.reloaded'); } catch (e) { /* ignore */ }
+
+  const VERSION = '1.2.1';
   const API = 'https://api.openai.com/v1';
   const MODEL = 'gpt-realtime-translate';
   const SOURCE_MODEL = 'gpt-realtime-whisper';
@@ -1728,7 +1740,7 @@
     ui.render();
     if (!apiKey) ui.openSetup();
     else prefetch();
-    if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
       navigator.serviceWorker.register('sw.js').catch(() => {});
     }
     // handle for debugging from the console
