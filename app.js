@@ -1,18 +1,20 @@
 /*
- * 口譯 — my own Japanese ⇄ English live interpreter.
- * Engine: OpenAI gpt-realtime-translate over WebRTC, one session per direction
- * (the official pattern for two-person conversation).
+ * 口譯 v1.2 — my own live interpreter (中文 ⇄ 日本語 ⇄ English).
+ * Speech: OpenAI gpt-realtime-translate over WebRTC, one session per direction.
+ * Typing: OpenAI Responses API. The phrasebook and 繁體 conversion work offline.
  * The API key lives only in this phone's localStorage and is only sent to api.openai.com.
  */
 (() => {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const API = 'https://api.openai.com/v1';
   const MODEL = 'gpt-realtime-translate';
   const SOURCE_MODEL = 'gpt-realtime-whisper';
-  // USD per connected minute (OpenAI pricing page, checked 2026-10-30)
-  const PRICE = { translate: 0.034, source: 0.017 };
+  const TEXT_MODELS = ['gpt-6.1-terra', 'gpt-5.4-mini']; // typed translation: the first one this account can use
+  const PRICE = { translate: 0.034, source: 0.017 };    // USD per connected minute (checked 2026-10-30)
+  const HOLD_MS = 450;                                   // pressing longer than this = hold-to-talk
+  const SPEAKER = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05A4.48 4.48 0 0 0 16.5 12zM14 3.23v2.06a7 7 0 0 1 0 13.42v2.06A9 9 0 0 0 14 3.23z"/></svg>';
 
   /* ---------- helpers ---------- */
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -28,6 +30,7 @@
     const d = new Date(ts);
     return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   };
+  const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
   class AppError extends Error {
     constructor(message, code, detail) {
@@ -38,7 +41,10 @@
   }
 
   /* ---------- storage & settings ---------- */
-  const K = { key: 'ky.key', settings: 'ky.settings', history: 'ky.history', usage: 'ky.usage', zh: 'ky.zhcode' };
+  const K = {
+    key: 'ky.key', settings: 'ky.settings', history: 'ky.history', usage: 'ky.usage',
+    zh: 'ky.zhcode', textModel: 'ky.textmodel', mine: 'ky.myphrases',
+  };
   const store = {
     get(k, d) {
       try {
@@ -57,18 +63,23 @@
   };
 
   const DEFAULTS = {
-    mode: 'talk',          // 'talk' (對話) | 'listen' (聆聽)
+    mode: 'talk',          // 'talk' (對話) | 'listen' (聆聽) | 'phrases' (常用句)
     myLang: 'zh',          // my language: their words come back in it ('zh' | 'en')
     theirLang: 'ja',       // the other person's language: my words go out in it ('ja' | 'en')
-    speakJa: true,         // play the Japanese translation aloud (for them)
-    speakMine: true,       // play the translation of their words aloud (for me)
+    handsFree: false,      // talk mode without buttons (experimental)
+    speakJa: true,         // play the translation that is meant for them
+    speakMine: true,       // play the translation that is meant for me
     listenSpeak: false,    // listen mode: play audio (earphones recommended)
-    showSource: true,      // source-language subtitles
+    showSource: true,      // source-language subtitles (also helps the auto-stop)
+    autoBig: true,         // after "我說", show the translation full screen
+    trad: true,            // show Chinese in Traditional characters
     micType: 'near_field', // 'near_field' phone near mouth | 'far_field' phone on table
-    silenceMs: 1200,       // auto-stop after this much silence
+    silenceMs: 1500,       // tap mode: stop after this much silence
     idleMin: 2,            // hang up after this many idle minutes
   };
   const settings = Object.assign({}, DEFAULTS, store.get(K.settings, {}));
+  if (!['talk', 'listen', 'phrases'].includes(settings.mode)) settings.mode = 'talk';
+  if (![1000, 1500, 2200].includes(Number(settings.silenceMs))) settings.silenceMs = DEFAULTS.silenceMs;
   const saveSettings = () => store.set(K.settings, settings);
   let apiKey = String(store.get(K.key, '') || '');
 
@@ -92,13 +103,22 @@
     ja: 'すみません、翻訳アプリを使っています。このスマホに向かって、ゆっくり話していただけますか。',
     en: "Excuse me, I'm using a translation app. Could you please speak slowly toward this phone?",
   };
+  // Chinese is shown (and read aloud) in Traditional characters with Taiwan wording.
+  const showText = (text, lang) => (lang === 'zh' && settings.trad && typeof window.toTrad === 'function' ? window.toTrad(text) : text);
+  const guessLang = (text) => {
+    if (/[぀-ヿ]/.test(text)) return 'ja';
+    const latin = (text.match(/[A-Za-z]/g) || []).length;
+    const cjk = (text.match(/[㐀-鿿]/g) || []).length;
+    return latin > cjk ? 'en' : 'zh';
+  };
 
-  /* ---------- OpenAI: client secrets ---------- */
-  const diag = { lastError: '', variant: '' };
+  /* ---------- OpenAI calls ---------- */
+  const diag = { lastError: '', variant: '', textModel: '' };
   const secretCache = new Map(); // "lang|mic|source" -> { value, exp }
   let variantFloor = 0;           // after a config is rejected, start from the simpler one
   let sourceWarned = false;
-  let zhCode = String(store.get(K.zh, '') || ''); // 'zh-TW' if OpenAI accepts it, otherwise 'zh'
+  let zhCode = String(store.get(K.zh, '') || '');             // 'zh-TW' if OpenAI accepts it, otherwise 'zh'
+  let textModel = String(store.get(K.textModel, '') || '');
 
   async function timedFetch(url, opts, ms) {
     const ac = new AbortController();
@@ -113,7 +133,7 @@
     }
   }
 
-  async function httpError(r) {
+  async function httpError(r, what) {
     let body = '';
     try { body = await r.text(); } catch (e) { /* ignore */ }
     let detail = body.slice(0, 300);
@@ -121,21 +141,22 @@
       const j = JSON.parse(body);
       if (j && j.error) detail = j.error.message || j.error.code || detail;
     } catch (e) { /* not JSON */ }
+    const name = what || '口譯模型';
     const map = {
       400: '請求被拒絕（設定不被接受）',
       401: 'API 金鑰無效或已被刪除',
-      403: '這把金鑰沒有權限使用口譯模型（檢查專案的模型權限）',
-      404: '找不到口譯模型（帳號可能還不能用 gpt-realtime-translate）',
+      403: `這把金鑰沒有權限使用${name}（檢查專案的模型權限）`,
+      404: `找不到${name}（帳號可能還不能用）`,
       429: '額度不足、超過預算上限，或請求太頻繁',
     };
     const base = map[r.status] || (r.status >= 500 ? 'OpenAI 伺服器暫時有問題，稍後再試' : '連線失敗');
     return new AppError(`${base}（${r.status}）`, 'http' + r.status, detail);
   }
 
-  function sessionVariants(lang, mic) {
+  function sessionVariants(lang, mic, source) {
     const input = { noise_reduction: { type: mic } };
     const withSource = Object.assign({}, input);
-    if (settings.showSource) withSource.transcription = { model: SOURCE_MODEL };
+    if (source) withSource.transcription = { model: SOURCE_MODEL };
     const sess = (inp) => ({ model: MODEL, audio: Object.assign(inp ? { input: inp } : {}, { output: { language: lang } }) });
     return [
       { name: 'full', body: { session: sess(withSource), expires_after: { anchor: 'created_at', seconds: 3600 } } },
@@ -145,19 +166,19 @@
     ];
   }
 
-  async function getSecret(lang, mic, opts) {
+  async function getSecret(lang, mic, source, opts) {
     const fresh = !!(opts && opts.fresh);
-    const sig = [lang, mic, settings.showSource].join('|');
+    const sig = [lang, mic, source].join('|');
     const cached = secretCache.get(sig);
     if (!fresh && cached && cached.exp - Date.now() / 1000 > 120) return cached.value;
     if (!apiKey) throw new AppError('還沒設定 OpenAI API 金鑰', 'nokey');
     // Chinese: ask for Taiwan Chinese first, fall back to plain 'zh' if the API rejects it.
     const codes = lang === 'zh' ? (zhCode ? [zhCode] : ['zh-TW', 'zh']) : [lang];
-    const count = sessionVariants(lang, mic).length;
+    const count = sessionVariants(lang, mic, source).length;
     let lastErr = null;
     for (let i = variantFloor; i < count; i++) {
       for (const code of codes) {
-        const v = sessionVariants(code, mic)[i];
+        const v = sessionVariants(code, mic, source)[i];
         const r = await timedFetch(`${API}/realtime/translations/client_secrets`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -173,7 +194,7 @@
             zhCode = code;
             store.set(K.zh, code);
           }
-          if (settings.showSource && i >= 2 && !sourceWarned) {
+          if (source && i >= 2 && !sourceWarned) {
             sourceWarned = true;
             ui.toast('原文字幕暫時不能用，先只顯示翻譯');
           }
@@ -192,6 +213,56 @@
     headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/sdp' },
     body: sdp,
   }, 15000);
+
+  const TARGET_DESC = {
+    ja: 'natural, polite spoken Japanese (です／ます form) that a traveler can say or show to shop, restaurant and hotel staff in Japan',
+    en: 'natural, polite spoken English',
+    zh: 'Traditional Chinese as used in Taiwan (繁體中文、台灣用語)',
+  };
+
+  function responseText(j) {
+    if (!j) return '';
+    if (typeof j.output_text === 'string') return j.output_text;
+    const parts = [];
+    (Array.isArray(j.output) ? j.output : []).forEach((item) => {
+      (Array.isArray(item && item.content) ? item.content : []).forEach((c) => {
+        if (c && c.type === 'output_text' && c.text) parts.push(c.text);
+      });
+    });
+    return parts.join('');
+  }
+
+  async function translateText(text, target) {
+    if (!apiKey) throw new AppError('還沒設定 OpenAI API 金鑰', 'nokey');
+    const instructions = `You are a professional interpreter helping a traveler from Taiwan. Translate the user's message into ${TARGET_DESC[target]}. Reply with the translation only: no quotes, notes, explanations or romanization. Keep names, numbers, prices, dates and times exact. If the message is already in that language, return it unchanged.`;
+    const models = textModel ? [textModel].concat(TEXT_MODELS.filter((m) => m !== textModel)) : TEXT_MODELS.slice();
+    let lastErr = null;
+    for (const model of models) {
+      const r = await timedFetch(`${API}/responses`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, instructions, input: text, reasoning: { effort: 'none' }, max_output_tokens: 600, store: false }),
+      }, 25000);
+      if (r.ok) {
+        let j = null;
+        try { j = await r.json(); } catch (e) { /* handled below */ }
+        const out = responseText(j).trim();
+        if (out) {
+          diag.textModel = model;
+          if (textModel !== model) {
+            textModel = model;
+            store.set(K.textModel, model);
+          }
+          return out;
+        }
+        lastErr = new AppError('翻譯結果是空的，請再試一次', 'empty');
+        continue;
+      }
+      lastErr = await httpError(r, '翻譯模型');
+      if (![400, 403, 404].includes(r.status)) break; // only an unavailable model is worth trying the next one
+    }
+    throw lastErr;
+  }
 
   /* ---------- microphone & level meter ---------- */
   const meter = {
@@ -259,7 +330,7 @@
   /* ---------- one translation session (one direction) ---------- */
   class Session {
     constructor(name) {
-      this.name = name;       // 'mine' (→ 日本語) | 'theirs' (日本語 →)
+      this.name = name;       // 'mine' (→ their language) | 'theirs' (→ my language)
       this.state = 'idle';    // idle | connecting | open
       this.pc = null;
       this.dc = null;
@@ -276,8 +347,10 @@
 
     wanted() {
       const lang = targetOf(this.name);
-      const micType = settings.mode === 'listen' ? 'far_field' : settings.micType;
-      return { lang, micType, sig: [lang, micType, settings.showSource].join('|') };
+      const handsFree = settings.mode === 'talk' && settings.handsFree;
+      const micType = settings.mode === 'listen' || handsFree ? 'far_field' : settings.micType;
+      const source = settings.showSource && !handsFree;
+      return { lang, micType, source, sig: [lang, micType, source].join('|') };
     }
 
     connect() {
@@ -298,11 +371,11 @@
     }
 
     async open(w) {
-      const [stream, secret] = await Promise.all([mic.get(), getSecret(w.lang, w.micType)]);
+      const [stream, secret] = await Promise.all([mic.get(), getSecret(w.lang, w.micType, w.source)]);
       if (this.state !== 'connecting') throw new AppError('已取消', 'cancelled');
       const pc = new RTCPeerConnection();
       const track = stream.getAudioTracks()[0].clone();
-      track.enabled = false; // silence until a turn starts
+      track.enabled = false; // silence until someone talks
       this.pc = pc;
       this.track = track;
       this.sig = w.sig;
@@ -319,6 +392,7 @@
           if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
             this.reset();
             if (turn.dir && turn.sessionFor(turn.dir) === this) turn.stop('dropped');
+            if (hf.active) hf.stop('dropped');
             ui.toast('翻譯連線中斷了，下次按按鈕會自動重連');
             ui.render();
           }
@@ -333,7 +407,7 @@
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         let r = await postSdp(secret, offer.sdp);
-        if (r.status === 401) r = await postSdp(await getSecret(w.lang, w.micType, { fresh: true }), offer.sdp);
+        if (r.status === 401) r = await postSdp(await getSecret(w.lang, w.micType, w.source, { fresh: true }), offer.sdp);
         if (!r.ok) throw await httpError(r);
         const answer = await r.text();
         if (this.pc !== pc) throw new AppError('已取消', 'cancelled');
@@ -356,7 +430,9 @@
       try { ev = JSON.parse(raw); } catch (e) { return; }
       if (ev.type === 'session.input_transcript.delta' && ev.delta) {
         feed.delta(this.name, 'src', ev.delta);
+        turn.onInput(this.name);
       } else if (ev.type === 'session.output_transcript.delta' && ev.delta) {
+        hf.onOutput();
         feed.delta(this.name, 'dst', ev.delta);
       } else if (ev.type === 'error') {
         const m = (ev.error && (ev.error.message || ev.error.code)) || JSON.stringify(ev).slice(0, 200);
@@ -414,17 +490,21 @@
     }
   }
 
-  /* ---------- a turn: who is talking right now ---------- */
+  /* ---------- button mode: who is talking right now ---------- */
   const turn = {
     dir: null,        // 'mine' | 'theirs' | 'listen'
     phase: 'idle',    // 'connecting' | 'live'
+    holding: false,   // finger still on the button: stop on release, not on silence
     t0: 0,
     calib: [],
     floorSet: false,
+    noise: -60,
     thrOn: -48,
     thrOff: -54,
     spoke: false,
     lastVoice: 0,
+    gotInput: false,
+    lastInput: 0,
     timer: null,
 
     sessionFor(dir) { return dir === 'mine' ? sessions.mine : sessions.theirs; },
@@ -434,19 +514,25 @@
       else this.start(dir);
     },
 
-    async start(dir) {
+    async start(dir, opts) {
       if (!apiKey) { ui.openSetup(); return; }
+      if (hf.active) hf.stop('switch');
       if (this.dir) this.stop('switch');
       unlockAudio();
-      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      stopTTS();
+      big.close();
+      feed.pendingBig = null;
       const micReady = mic.get(); // ask for the mic while we still have the tap gesture
       const s = this.sessionFor(dir);
       const other = s === sessions.mine ? sessions.theirs : sessions.mine;
       this.dir = dir;
       this.phase = 'connecting';
+      this.holding = !!(opts && opts.hold);
       this.calib = [];
       this.floorSet = false;
       this.spoke = false;
+      this.gotInput = false;
+      this.lastInput = 0;
       this.t0 = performance.now();
       other.duck(true); // mute the other side so the mic does not translate it back
       s.duck(false);
@@ -469,9 +555,24 @@
       this.phase = 'live';
       this.t0 = performance.now();
       this.lastVoice = this.t0;
-      if (navigator.vibrate) navigator.vibrate(15);
+      if (navigator.vibrate && (!navigator.userActivation || navigator.userActivation.hasBeenActive)) navigator.vibrate(15);
       ui.render();
       idle.bump();
+    },
+
+    release(dir) { if (this.dir === dir && this.holding) this.stop('release'); },
+
+    tapped(dir) {
+      if (this.dir === dir && this.holding) {
+        this.holding = false;
+        ui.render();
+      }
+    },
+
+    onInput(name) {
+      if (this.phase !== 'live' || !this.dir || this.sessionFor(this.dir).name !== name) return;
+      this.gotInput = true;
+      this.lastInput = performance.now();
     },
 
     loop() {
@@ -479,7 +580,7 @@
       this.timer = setInterval(() => this.step(), 50);
     },
 
-    // Simple voice-activity detection for the auto-stop.
+    // Auto-stop: loudness that follows the room, plus "are words still arriving?"
     step() {
       if (!this.dir) { clearInterval(this.timer); return; }
       const db = meter.db();
@@ -488,22 +589,27 @@
       if (this.phase !== 'live' || now - this.t0 < 250) { this.calib.push(db); return; }
       if (!this.floorSet) {
         const a = this.calib.filter(Number.isFinite).sort((x, y) => x - y);
-        const floor = a.length ? a[Math.floor(a.length * 0.2)] : -70;
-        this.thrOn = Math.min(-28, Math.max(-50, floor + 12));
-        this.thrOff = this.thrOn - 6;
+        this.noise = Math.min(a.length ? a[Math.floor(a.length * 0.2)] : -65, -40);
         this.floorSet = true;
       }
+      this.thrOn = Math.min(-25, Math.max(-52, this.noise + 12));
+      this.thrOff = this.thrOn - 6;
       if (db > this.thrOn) {
         this.spoke = true;
         this.lastVoice = now;
-      } else if (this.spoke && db > this.thrOff) {
-        this.lastVoice = now;
+      } else {
+        if (this.spoke && db > this.thrOff) this.lastVoice = now;
+        this.noise += (db - this.noise) * (db > this.noise ? 0.015 : 0.1); // follow the room: rise slowly, fall fast
       }
-      if (this.dir === 'listen') return; // listen mode runs until stopped
+      if (this.dir === 'listen' || this.holding) return;
       const live = now - this.t0;
-      if (!this.spoke && live > 8000) this.stop('nothing');
-      else if (this.spoke && now - this.lastVoice > settings.silenceMs) this.stop('auto');
-      else if (live > 90000) this.stop('max');
+      const heard = this.spoke || this.gotInput;
+      const quiet = now - this.lastVoice;
+      const wordsQuiet = this.gotInput ? now - this.lastInput : Infinity;
+      if (!heard && live > 8000) this.stop('nothing');
+      else if (heard && quiet > settings.silenceMs && wordsQuiet > 700) this.stop('auto');
+      else if (this.gotInput && wordsQuiet > settings.silenceMs + 1300 && live > 2500) this.stop('auto'); // noisy room
+      else if (live > 60000) this.stop('max');
     },
 
     stop(reason) {
@@ -512,10 +618,12 @@
       this.sessionFor(dir).setTalking(false);
       this.dir = null;
       this.phase = 'idle';
+      this.holding = false;
       clearInterval(this.timer);
       sessions.mine.duck(false);
       sessions.theirs.duck(false);
       feed.end(dir);
+      if (dir === 'mine' && settings.autoBig && reason !== 'switch' && reason !== 'mode') feed.wantBig();
       if (reason === 'nothing') ui.toast('沒有聽到聲音，已停止');
       ui.level(-100);
       ui.render();
@@ -528,10 +636,104 @@
       this.sessionFor(dir).setTalking(false);
       this.dir = null;
       this.phase = 'idle';
+      this.holding = false;
       clearInterval(this.timer);
       sessions.mine.duck(false);
       sessions.theirs.duck(false);
       feed.end(dir);
+      ui.level(-100);
+      ui.render();
+    },
+  };
+
+  /* ---------- hands-free mode (experimental) ---------- */
+  // Both directions listen at once; each one stays silent for speech already in its own language.
+  // Half duplex: while a translation is playing nobody listens, so the phone never translates itself.
+  const hf = {
+    active: false,
+    phase: 'idle',
+    open: null,
+    outUntil: 0,
+    timer: null,
+
+    toggle() {
+      if (this.active) this.stop('manual');
+      else this.start();
+    },
+
+    async start() {
+      if (!apiKey) { ui.openSetup(); return; }
+      if (turn.dir) turn.stop('switch');
+      unlockAudio();
+      stopTTS();
+      big.close();
+      const micReady = mic.get();
+      this.active = true;
+      this.phase = 'connecting';
+      this.open = null;
+      this.outUntil = 0;
+      feed.open = { mine: null, theirs: null };
+      sessions.mine.duck(false);
+      sessions.theirs.duck(false);
+      this.loop();
+      ui.render();
+      try {
+        await micReady;
+        await Promise.all([sessions.mine.connect(), sessions.theirs.connect()]);
+      } catch (e) {
+        if (this.active) this.cancel();
+        if (!e || e.code !== 'cancelled') ui.error(e);
+        return;
+      }
+      if (!this.active) return;
+      this.phase = 'live';
+      $('#banner').hidden = true;
+      this.gate(true);
+      ui.render();
+      idle.bump();
+    },
+
+    loop() {
+      clearInterval(this.timer);
+      this.timer = setInterval(() => this.step(), 100);
+    },
+
+    step() {
+      if (!this.active) { clearInterval(this.timer); return; }
+      ui.level(meter.db());
+      if (this.phase === 'live') this.gate(performance.now() >= this.outUntil);
+    },
+
+    gate(open) {
+      if (this.open === open) return;
+      this.open = open;
+      sessions.mine.setTalking(open);
+      sessions.theirs.setTalking(open);
+      ui.render();
+    },
+
+    // called while a translation (or the phone's own voice) is playing
+    onOutput(extraMs) {
+      if (!this.active) return;
+      this.outUntil = Math.max(this.outUntil, performance.now() + 1400 + (extraMs || 0));
+      this.gate(false);
+    },
+
+    stop() {
+      if (!this.active) return;
+      this.cancel();
+      idle.bump();
+    },
+
+    cancel() {
+      if (!this.active) return;
+      this.active = false;
+      this.phase = 'idle';
+      this.open = null;
+      clearInterval(this.timer);
+      sessions.mine.setTalking(false);
+      sessions.theirs.setTalking(false);
+      feed.open = { mine: null, theirs: null };
       ui.level(-100);
       ui.render();
     },
@@ -542,6 +744,7 @@
     items: [],
     open: { mine: null, theirs: null }, // card receiving text for each session
     last: { mine: 0, theirs: 0 },
+    pendingBig: null,                   // card to show full screen once its translation arrives
     saveTimer: null,
 
     init() {
@@ -559,42 +762,55 @@
 
     create(dir) {
       const sdir = dir === 'mine' ? 'mine' : 'theirs';
-      const it = {
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        dir,
-        from: sourceOf(sdir),
-        to: targetOf(sdir),
-        src: '',
-        dst: '',
-        ts: Date.now(),
-      };
+      return this.add({ dir, from: sourceOf(sdir), to: targetOf(sdir) }, true);
+    },
+
+    add(fields, live) {
+      const it = Object.assign({ id: newId(), ts: Date.now(), src: '', dst: '' }, fields);
       this.items.push(it);
       if (this.items.length > 300) this.items.splice(0, this.items.length - 300).forEach((g) => ui.removeCard(g));
       ui.addCard(it, true);
       ui.render();
+      if (!live) this.save();
       return it;
     },
 
     delta(sname, field, text) {
       const now = Date.now();
       const listening = settings.mode === 'listen' && sname === 'theirs';
+      const handsFree = hf.active;
       let it = this.open[sname];
-      if (it && listening && (it.src || it.dst)) {
-        // listen mode: start a new paragraph after a pause, or after a long finished sentence
-        const pause = now - this.last[sname] > 2500;
+      if (it && (listening || handsFree) && (it.src || it.dst)) {
+        // start a new card after a pause, or after a long finished sentence
+        const pause = now - this.last[sname] > (handsFree ? 2000 : 2500);
         const long = field === 'dst' && it.dst.length > 200 && /[.!?。！？]\s*$/.test(it.dst);
         if (pause || long) it = null;
       }
       if (!it) {
         it = this.create(sname === 'mine' ? 'mine' : listening ? 'listen' : 'theirs');
         this.open[sname] = it;
+        if (handsFree) {
+          if (sname === 'mine' && settings.autoBig) this.pendingBig = it.id;
+          else if (sname === 'theirs') big.close();
+        }
       }
       this.last[sname] = now;
       // keep a space between English sentences that arrive as separate pieces
       if (/[.!?,;:]$/.test(it[field]) && /^[A-Za-z0-9"'(]/.test(text)) text = ` ${text}`;
       it[field] += text;
       ui.updateCard(it);
+      if (field === 'dst' && this.pendingBig === it.id) {
+        this.pendingBig = null;
+        big.showItem(it);
+      }
       this.save();
+    },
+
+    wantBig() {
+      const it = this.open.mine;
+      if (!it) return;
+      if (it.dst) big.showItem(it);
+      else this.pendingBig = it.id;
     },
 
     end(dir) {
@@ -606,6 +822,7 @@
       const i = this.items.indexOf(it);
       if (i >= 0) this.items.splice(i, 1);
       Object.keys(this.open).forEach((k) => { if (this.open[k] === it) this.open[k] = null; });
+      if (this.pendingBig === it.id) this.pendingBig = null;
       ui.removeCard(it);
       ui.render();
       this.save();
@@ -615,6 +832,7 @@
       this.items.forEach((it) => ui.removeCard(it));
       this.items = [];
       this.open = { mine: null, theirs: null };
+      this.pendingBig = null;
       this.save();
       ui.render();
     },
@@ -628,7 +846,10 @@
   /* ---------- usage (estimate) ---------- */
   const usage = {
     d: Object.assign({ min: 0, usd: 0, since: Date.now() }, store.get(K.usage, {})),
-    rate() { return PRICE.translate + (settings.showSource ? PRICE.source : 0); },
+    rate() {
+      const handsFree = settings.mode === 'talk' && settings.handsFree;
+      return PRICE.translate + (settings.showSource && !handsFree ? PRICE.source : 0);
+    },
     add(min) {
       if (!(min > 0)) return;
       this.d.min += min;
@@ -641,7 +862,7 @@
       const min = this.d.min + this.liveMin();
       const usd = this.d.usd + this.live();
       const since = new Date(this.d.since).toLocaleDateString('zh-TW');
-      return `這支手機自 ${since} 起累計連線 ${min.toFixed(1)} 分鐘，估計約 US$${usd.toFixed(2)}。依官方單價估算（兩個方向各算一條連線），實際以 OpenAI 帳單為準。`;
+      return `這支手機自 ${since} 起累計連線 ${min.toFixed(1)} 分鐘，估計約 US$${usd.toFixed(2)}。依官方單價估算（兩個方向各算一條連線，打字翻譯另計但很少），實際以 OpenAI 帳單為準。`;
     },
     reset() {
       this.d = { min: 0, usd: 0, since: Date.now() };
@@ -649,7 +870,7 @@
     },
   };
 
-  /* ---------- idle hang-up, wake lock, background ---------- */
+  /* ---------- idle hang-up, wake lock, audio helpers ---------- */
   const idle = {
     timer: null,
     bump() {
@@ -660,9 +881,11 @@
     },
     fire() {
       if (turn.dir && turn.dir !== 'listen') { this.bump(); return; } // never cut someone mid-sentence
-      const listening = turn.dir === 'listen';
+      const what = hf.active ? 'hf' : turn.dir === 'listen' ? 'listen' : '';
       closeAll();
-      ui.toast(listening ? '一段時間沒有聲音，已停止聆聽並斷線' : '閒置太久，已自動斷線（省錢）');
+      if (what === 'hf') ui.toast('一段時間沒人講話，已停止免按鍵並斷線');
+      else if (what === 'listen') ui.toast('一段時間沒有聲音，已停止聆聽並斷線');
+      else ui.toast('閒置太久，已自動斷線（省錢）');
     },
   };
 
@@ -684,6 +907,7 @@
 
   function closeAll() {
     if (turn.dir) turn.cancel();
+    if (hf.active) hf.cancel();
     sessions.mine.close();
     sessions.theirs.close();
     mic.stop();
@@ -702,20 +926,31 @@
     });
   }
 
-  function prefetch() {
-    if (!apiKey || navigator.onLine === false) return;
-    const micType = settings.mode === 'listen' ? 'far_field' : settings.micType;
-    if (settings.mode === 'talk') getSecret(settings.theirLang, micType).catch(() => {});
-    getSecret(settings.myLang, micType).catch(() => {});
+  let ttsPrimed = false;
+  // iOS only lets a page speak after a tap; say nothing once inside the tap so later speech works.
+  function primeTTS() {
+    if (ttsPrimed || !('speechSynthesis' in window)) return;
+    try {
+      const u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      window.speechSynthesis.speak(u);
+      ttsPrimed = true;
+    } catch (e) { /* ignore */ }
+  }
+
+  function stopTTS() {
+    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
   }
 
   function speakText(text, lang) {
     if (!text) return;
     if (!('speechSynthesis' in window)) { ui.toast('這台裝置不支援朗讀'); return; }
-    if (turn.dir) turn.stop('tts');
+    if (turn.dir) turn.stop('tts'); // do not translate our own voice
+    const said = showText(text, lang);
+    hf.onOutput(Array.from(said).length * (lang === 'en' ? 70 : 160));
     const synth = window.speechSynthesis;
     synth.cancel();
-    const u = new SpeechSynthesisUtterance(text);
+    const u = new SpeechSynthesisUtterance(said);
     const tag = (LANGS[lang] && LANGS[lang].tts) || lang;
     u.lang = tag;
     u.rate = lang === 'ja' ? 0.95 : 1;
@@ -726,15 +961,28 @@
     synth.speak(u);
   }
 
+  function prefetch() {
+    if (!apiKey || navigator.onLine === false || settings.mode === 'phrases') return;
+    const list = settings.mode === 'listen' ? [sessions.theirs] : [sessions.mine, sessions.theirs];
+    list.forEach((s) => {
+      const w = s.wanted();
+      getSecret(w.lang, w.micType, w.source).catch(() => {});
+    });
+  }
+
   function setMode(m) {
     if (settings.mode === m) return;
     if (turn.dir) turn.stop('mode');
+    if (hf.active) hf.stop();
+    const prev = settings.mode;
     settings.mode = m;
     saveSettings();
-    sessions.theirs.close(); // the two modes use different microphone profiles
+    if (m === 'listen' || prev === 'listen') sessions.theirs.close(); // listen uses a different microphone profile
     if (m === 'listen') sessions.mine.close();
     sessions.mine.applyVolume();
     sessions.theirs.applyVolume();
+    big.close();
+    if (m === 'phrases') phrasebook.render();
     ui.render();
     prefetch();
   }
@@ -744,40 +992,63 @@
     const [my, their] = pair.split('-');
     if (settings.myLang === my && settings.theirLang === their) return;
     if (turn.dir) turn.cancel();
+    if (hf.active) hf.stop();
     if (settings.theirLang !== their) sessions.mine.close();  // "我說" now goes out in another language
     if (settings.myLang !== my) sessions.theirs.close();      // "對方說" now comes back in another language
     settings.myLang = my;
     settings.theirLang = their;
     saveSettings();
     syncSettingsUI();
+    phrasebook.render();
     ui.render();
     prefetch();
     ui.toast(`${langName(my)} ⇄ ${langName(their)}`);
   }
 
+  function setHandsFree(on) {
+    if (settings.handsFree === on) return;
+    if (turn.dir) turn.cancel();
+    if (hf.active) hf.stop();
+    settings.handsFree = on;
+    saveSettings();
+    sessions.mine.close();   // hands-free uses different session settings (table mic, no subtitles)
+    sessions.theirs.close();
+    ui.render();
+    prefetch();
+    ui.toast(on ? '免按鍵（實驗）：按紫色按鈕開始，兩人直接輪流講' : '已切回按鍵模式');
+  }
+
   /* ---------- big view (show to the other person) ---------- */
   const big = {
     id: null,
-    show({ id = null, text, sub = '', lang = 'ja', reply = false }) {
+    cur: null,
+    show({ id = null, text, lang = 'ja', sub = '', subLang = 'zh', reply = false }) {
       this.id = id;
+      this.cur = { text, lang, sub, subLang };
       const t = $('#bigText');
-      t.textContent = text || '…';
+      t.textContent = showText(text, lang) || '…';
       t.lang = langTag(lang);
       const s = $('#bigSub');
-      s.textContent = sub || '';
+      s.textContent = sub ? showText(sub, subLang) : '';
+      s.lang = langTag(subLang);
       s.hidden = !sub;
-      $('#bigReply').hidden = !reply || settings.mode !== 'talk';
+      $('#bigReply').hidden = !reply || settings.mode === 'listen';
       $('#big').hidden = false;
       this.fit();
     },
+    showItem(it) {
+      this.show({ id: it.id, text: it.dst, lang: it.to, sub: settings.showSource ? it.src : '', subLang: it.from, reply: it.dir === 'mine' });
+    },
     update(it) {
       if (this.id !== it.id || $('#big').hidden) return;
-      $('#bigText').textContent = it.dst || '…';
+      this.cur = { text: it.dst, lang: it.to, sub: it.src, subLang: it.from };
+      $('#bigText').textContent = showText(it.dst, it.to) || '…';
       const s = $('#bigSub');
-      s.textContent = settings.showSource ? it.src : '';
+      s.textContent = settings.showSource && it.src ? showText(it.src, it.from) : '';
       s.hidden = !s.textContent;
       this.fit();
     },
+    say() { if (this.cur) speakText(this.cur.text, this.cur.lang); },
     // Largest font size that still fits the screen.
     fit() {
       const t = $('#bigText');
@@ -798,6 +1069,169 @@
     },
   };
 
+  /* ---------- phrasebook (offline) ---------- */
+  const phrasebook = {
+    entries: new Map(),
+    mine() {
+      const list = store.get(K.mine, []);
+      return Array.isArray(list) ? list : [];
+    },
+    render() {
+      const list = $('#phraseList');
+      const cats = $('#phraseCats');
+      list.textContent = '';
+      cats.textContent = '';
+      this.entries.clear();
+      const ref = settings.myLang;
+      const tgt = settings.theirLang;
+      const groups = [{
+        id: 'mine',
+        name: '我的',
+        custom: true,
+        items: this.mine().map((p) => ({ key: p.id, ref: p.src, refLang: p.srcLang, tgt: p.dst, tgtLang: p.dstLang, custom: true })),
+      }];
+      (window.PHRASES || []).forEach((g) => {
+        groups.push({
+          id: g.id,
+          name: g.name,
+          items: g.items.map((p, i) => ({ key: `${g.id}-${i}`, ref: p[ref] || p.zh, refLang: p[ref] ? ref : 'zh', tgt: p[tgt], tgtLang: tgt })),
+        });
+      });
+      groups.forEach((g) => {
+        const chip = h('button', 'cat', g.name);
+        chip.type = 'button';
+        chip.dataset.cat = g.id;
+        cats.appendChild(chip);
+        const head = h('h3', 'psec', g.name);
+        head.id = `psec-${g.id}`;
+        list.appendChild(head);
+        if (!g.items.length && g.custom) {
+          list.appendChild(h('p', 'pempty', '按下方「＋ 新增我的句子」，打字翻譯後就能存在這裡（例如你的過敏食物、要去的地址）。'));
+        }
+        g.items.forEach((e) => {
+          this.entries.set(e.key, e);
+          const row = h('div', 'prow');
+          row.dataset.key = e.key;
+          const main = h('button', 'ptext');
+          main.type = 'button';
+          main.dataset.act = 'big';
+          const r = h('span', 'pref', showText(e.ref, e.refLang));
+          r.lang = langTag(e.refLang);
+          const t = h('span', 'ptgt', showText(e.tgt, e.tgtLang));
+          t.lang = langTag(e.tgtLang);
+          main.append(r, t);
+          const say = h('button', 'pbtn');
+          say.type = 'button';
+          say.dataset.act = 'say';
+          say.setAttribute('aria-label', '唸出來');
+          say.innerHTML = SPEAKER;
+          row.append(main, say);
+          if (e.custom) {
+            const del = h('button', 'pbtn', '✕');
+            del.type = 'button';
+            del.dataset.act = 'del';
+            del.setAttribute('aria-label', '刪除');
+            row.appendChild(del);
+          }
+          list.appendChild(row);
+        });
+      });
+    },
+    act(key, action) {
+      const e = this.entries.get(key);
+      if (!e) return;
+      if (action === 'say') speakText(e.tgt, e.tgtLang);
+      else if (action === 'del') {
+        if (!window.confirm('刪除這個句子？')) return;
+        store.set(K.mine, this.mine().filter((p) => p.id !== key));
+        this.render();
+      } else {
+        big.show({ text: e.tgt, lang: e.tgtLang, sub: e.ref, subLang: e.refLang, reply: true });
+      }
+    },
+    add(item) {
+      const list = this.mine();
+      if (list.some((p) => p.dst === item.dst)) return false;
+      list.unshift(Object.assign({ id: newId() }, item));
+      store.set(K.mine, list.slice(0, 200));
+      this.render();
+      return true;
+    },
+  };
+
+  /* ---------- typed translation ---------- */
+  const typer = {
+    dir: 'out',      // 'out' = into their language, 'in' = into my language
+    touched: false,  // the user picked a direction by hand
+    last: null,
+    open() {
+      $('#typeResult').hidden = true;
+      $('#typeMsg').textContent = '';
+      $('#typeMsg').className = 'msgline';
+      this.touched = false;
+      this.last = null;
+      this.setDir('out');
+      $('#typer').hidden = false;
+      $('#typeInput').focus();
+    },
+    setDir(d) {
+      this.dir = d;
+      $$('#typeDir button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === d)));
+    },
+    labels() {
+      $('#typeDir [data-v=out]').textContent = `翻成${LANGS[settings.theirLang].word}`;
+      $('#typeDir [data-v=in]').textContent = `翻成${LANGS[settings.myLang].word}`;
+      $('#typeInput').placeholder = `輸入要說的話（${LANGS[settings.myLang].word}）…`;
+    },
+    autoDir() {
+      if (this.touched) return;
+      const text = $('#typeInput').value.trim();
+      if (!text) return;
+      this.setDir(guessLang(text) === settings.theirLang ? 'in' : 'out');
+    },
+    async go() {
+      const input = $('#typeInput');
+      const text = input.value.trim();
+      if (!text) { input.focus(); return; }
+      primeTTS();
+      const target = this.dir === 'out' ? settings.theirLang : settings.myLang;
+      const srcLang = guessLang(text);
+      const btn = $('#typeGo');
+      const msg = $('#typeMsg');
+      btn.disabled = true;
+      msg.textContent = '翻譯中…';
+      msg.className = 'msgline';
+      try {
+        const out = await translateText(text, target);
+        this.last = { src: text, srcLang, dst: out, dstLang: target, out: this.dir === 'out' };
+        const o = $('#typeOut');
+        o.textContent = showText(out, target);
+        o.lang = langTag(target);
+        $('#typeResult').hidden = false;
+        msg.textContent = '';
+        feed.add({ dir: this.dir === 'out' ? 'mine' : 'theirs', typed: true, from: srcLang, to: target, src: text, dst: out });
+        if (this.dir === 'out' && settings.speakJa) speakText(out, target);
+      } catch (e) {
+        msg.textContent = `✗ ${e.message}${e.detail ? '：' + e.detail : ''}`;
+        msg.className = 'msgline bad';
+        if (e.code === 'nokey') ui.openSetup();
+      } finally {
+        btn.disabled = false;
+      }
+    },
+    showBig() {
+      if (!this.last) return;
+      ui.closeSheet('typer');
+      big.show({ text: this.last.dst, lang: this.last.dstLang, sub: this.last.src, subLang: this.last.srcLang, reply: this.last.out });
+    },
+    say() { if (this.last) speakText(this.last.dst, this.last.dstLang); },
+    save() {
+      if (!this.last) return;
+      const ok = phrasebook.add({ src: this.last.src, srcLang: this.last.srcLang, dst: this.last.dst, dstLang: this.last.dstLang });
+      ui.toast(ok ? '已存到常用句「我的」' : '這句已經存過了');
+    },
+  };
+
   /* ---------- UI ---------- */
   const ui = {
     nodes: new Map(),
@@ -805,59 +1239,85 @@
     toastTimer: null,
 
     render() {
-      $$('.mode').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === settings.mode)));
-      $('#talkControls').hidden = settings.mode !== 'talk';
-      $('#listenControls').hidden = settings.mode !== 'listen';
+      const mode = settings.mode;
+      const handsFree = mode === 'talk' && settings.handsFree;
+      $$('.mode').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+      $('#feed').hidden = mode === 'phrases';
+      $('#phraseView').hidden = mode !== 'phrases';
+      $('#talkControls').hidden = mode !== 'talk' || handsFree;
+      $('#hfControls').hidden = !handsFree;
+      $('#listenControls').hidden = mode !== 'listen';
+      $('#phraseControls').hidden = mode !== 'phrases';
+      $('#typeBtn').hidden = mode === 'listen';
+      $('#hfBtn').hidden = mode !== 'talk';
+      $('#hfBtn').setAttribute('aria-pressed', String(handsFree));
+
       const my = langName(settings.myLang);
       const their = langName(settings.theirLang);
       $('[data-label=mine]').textContent = `${my} → ${their}`;
       $('[data-label=theirs]').textContent = `${their} → ${my}`;
       $('[data-label=listen]').textContent = `${their} → ${my}`;
-      $$('[data-myword]').forEach((e) => { e.textContent = LANGS[settings.myLang].word; });
-      $$('[data-theirword]').forEach((e) => { e.textContent = LANGS[settings.theirLang].word; });
+      $('[data-label=hf]').textContent = `${my} ⇄ ${their}`;
       $$('[data-idle]').forEach((e) => { e.textContent = String(settings.idleMin); });
       const pair = `${settings.myLang}-${settings.theirLang}`;
       $$('[data-pair]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.pair === pair)));
       const intro = $('#introText');
       intro.textContent = INTRO[settings.theirLang] || INTRO.ja;
       intro.lang = langTag(settings.theirLang);
-      $('#introChip').hidden = settings.mode !== 'talk';
-      $$('.talk').forEach((b) => {
+      typer.labels();
+
+      const idleHints = { mine: '點一下說，或按住說', theirs: '點一下讓對方說，或按住', listen: '點一下開始翻譯' };
+      $$('.talk[data-dir]').forEach((b) => {
         const d = b.dataset.dir;
+        if (d === 'hf') return;
         const active = turn.dir === d;
         b.classList.toggle('connecting', active && turn.phase === 'connecting');
-        b.classList.toggle('live', active && turn.phase === 'live');
+        b.classList.toggle('live', active && turn.phase === 'live' && !turn.holding);
+        b.classList.toggle('holding', active && turn.holding);
         b.setAttribute('aria-pressed', String(active));
-        let hint = { mine: '按一下開始說', theirs: '按一下讓對方說', listen: '按一下開始翻譯' }[d] || '';
+        let hint = idleHints[d] || '';
         if (active && turn.phase === 'connecting') hint = '連線中…稍等再說';
-        else if (active && d === 'listen') hint = '聆聽中・再按一下停止';
+        else if (active && turn.holding) hint = '講完放開';
+        else if (active && d === 'listen') hint = '聆聽中・再點一下停止';
         else if (active) hint = '請說・講完會自動停';
         b.querySelector('.hint').textContent = hint;
         if (d === 'listen') b.querySelector('.t1').textContent = active ? '停止聆聽' : '開始聆聽';
         if (!active) b.style.setProperty('--lvl', '0');
       });
+
+      const hb = $('.talk.hf');
+      hb.classList.toggle('connecting', hf.active && hf.phase === 'connecting');
+      hb.classList.toggle('live', hf.active && hf.phase === 'live' && hf.open === true);
+      hb.classList.toggle('gated', hf.active && hf.phase === 'live' && hf.open === false);
+      hb.setAttribute('aria-pressed', String(hf.active));
+      hb.querySelector('.t1').textContent = hf.active ? '停止' : '開始';
+      let hint = '點一下開始，兩人直接輪流講';
+      if (hf.active && hf.phase === 'connecting') hint = '連線中…';
+      else if (hf.active && hf.open) hint = '聆聽中・直接講';
+      else if (hf.active) hint = '播放翻譯中…';
+      hb.querySelector('.hint').textContent = hint;
+      if (!hf.active) hb.style.setProperty('--lvl', '0');
+
       $('#empty').hidden = feed.items.length > 0;
       this.status();
     },
 
     status() {
-      const st = $('#status');
+      const line = $('#statusLine');
       const all = [sessions.mine, sessions.theirs];
       const open = all.filter((s) => s.state === 'open');
-      st.classList.remove('on', 'busy');
+      line.classList.remove('busy');
       if (open.length) {
         const since = Math.min(...open.map((s) => s.openedAt));
         const sec = Math.max(0, Math.floor((Date.now() - since) / 1000));
-        st.textContent = `${Math.floor(sec / 60)}:${pad2(sec % 60)} · US$${usage.live().toFixed(2)}`;
-        st.classList.add('on');
-        st.setAttribute('aria-label', '已連線，按一下斷線');
+        $('#statusText').textContent = `已連線 ${Math.floor(sec / 60)}:${pad2(sec % 60)} · 約 US$${usage.live().toFixed(2)}`;
+        line.hidden = false;
       } else if (all.some((s) => s.state === 'connecting')) {
-        st.textContent = '連線中';
-        st.classList.add('busy');
-        st.setAttribute('aria-label', '連線中');
+        $('#statusText').textContent = '連線中…';
+        line.classList.add('busy');
+        line.hidden = false;
       } else {
-        st.textContent = '未連線';
-        st.setAttribute('aria-label', '未連線');
+        line.hidden = true;
       }
     },
 
@@ -873,7 +1333,7 @@
     },
 
     level(db) {
-      const b = turn.dir ? $(`.talk[data-dir="${turn.dir}"]`) : null;
+      const b = hf.active ? $('.talk.hf') : turn.dir ? $(`.talk[data-dir="${turn.dir}"]`) : null;
       if (!b) return;
       const pct = Math.max(0, Math.min(1, (db + 70) / 45));
       b.style.setProperty('--lvl', pct.toFixed(3));
@@ -883,35 +1343,32 @@
       const art = h('article', `card ${it.dir}`);
       art.dataset.id = it.id;
       const head = h('header', 'card-head');
-      const who = it.dir === 'mine' ? '我說' : it.dir === 'listen' ? '聆聽' : '對方說';
-      head.append(h('span', 'who', who), h('span', 'langs', `${langName(it.from)} → ${langName(it.to)}`), h('time', 'ts', fmtTime(it.ts)));
-      const src = h('p', 'src');
-      src.lang = langTag(it.from);
-      const dst = h('p', 'dst');
-      dst.lang = langTag(it.to);
-      const actions = h('footer', 'card-actions');
-      const zoom = h('button', 'chip', it.dir === 'mine' ? '放大給對方看' : '放大');
-      zoom.type = 'button';
-      zoom.dataset.act = 'zoom';
-      const say = h('button', 'chip', it.dir === 'mine' ? '再唸一次' : '朗讀');
+      const who = it.typed ? '打字' : it.dir === 'mine' ? '我說' : it.dir === 'listen' ? '聆聽' : '對方說';
+      head.append(h('span', 'who', who), h('time', 'ts', fmtTime(it.ts)));
+      const say = h('button', 'say');
       say.type = 'button';
       say.dataset.act = 'say';
-      actions.append(zoom, say);
-      art.append(head, src, dst, actions);
+      say.setAttribute('aria-label', '唸出來');
+      say.innerHTML = SPEAKER;
+      head.appendChild(say);
+      const src = h('p', 'src');
+      const dst = h('p', 'dst');
+      art.append(head, src, dst);
       $('#feed').appendChild(art);
-      const n = { art, src, dst, actions };
+      const n = { art, src, dst, say };
       this.nodes.set(it.id, n);
       this.fill(it, n);
       if (live) this.scrollEnd(true);
     },
 
     fill(it, n) {
-      n.src.textContent = it.src;
+      n.src.textContent = showText(it.src, it.from);
+      n.src.lang = langTag(it.from);
       n.src.hidden = !it.src || !settings.showSource;
-      n.dst.textContent = it.dst || '翻譯中…';
-      n.dst.classList.toggle('pending', !it.dst);
+      n.dst.textContent = it.dst ? showText(it.dst, it.to) : '翻譯中…';
       n.dst.lang = it.dst ? langTag(it.to) : 'zh-Hant';
-      n.actions.hidden = !it.dst;
+      n.dst.classList.toggle('pending', !it.dst);
+      n.say.hidden = !it.dst;
     },
 
     updateCard(it) {
@@ -924,7 +1381,12 @@
       if (nearEnd) this.scrollEnd(true);
     },
 
-    refillAll() { feed.items.forEach((it) => { const n = this.nodes.get(it.id); if (n) this.fill(it, n); }); },
+    refillAll() {
+      feed.items.forEach((it) => {
+        const n = this.nodes.get(it.id);
+        if (n) this.fill(it, n);
+      });
+    },
 
     removeCard(it) {
       const n = this.nodes.get(it.id);
@@ -960,8 +1422,7 @@
     needAudioTap(session) {
       const b = $('#banner');
       b.querySelector('.msg').textContent = '翻譯的聲音被擋住了，點這裡打開聲音';
-      const d = b.querySelector('.detail');
-      d.hidden = true;
+      b.querySelector('.detail').hidden = true;
       b.hidden = false;
       b.onclick = () => {
         session.audio.play().catch(() => {});
@@ -994,8 +1455,9 @@
       `網址 ${location.origin}${location.pathname}`,
       `主畫面 App：${standalone ? '是' : '否'}　安全連線：${window.isSecureContext ? '是' : '否'}`,
       `麥克風 API：${navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? '有' : '無'}　WebRTC：${'RTCPeerConnection' in window ? '有' : '無'}　螢幕常亮：${'wakeLock' in navigator ? '有' : '無'}`,
-      `連線設定：${diag.variant || '（還沒連過）'}`,
-      `我說：${sessions.mine.state}　對方說：${sessions.theirs.state}`,
+      `語言：${settings.myLang}-${settings.theirLang}　中文代碼：${zhCode || '未定'}　繁體轉換：${typeof window.toTrad === 'function' ? '有' : '無'}`,
+      `連線設定：${diag.variant || '（還沒連過）'}　打字模型：${diag.textModel || textModel || '（還沒用過）'}`,
+      `模式：${settings.mode}${settings.handsFree ? '（免按鍵）' : ''}　我說：${sessions.mine.state}　對方說：${sessions.theirs.state}`,
       `最後錯誤：${diag.lastError || '無'}`,
       `UA ${navigator.userAgent}`,
     ].join('\n');
@@ -1018,17 +1480,21 @@
     if (settings[k] === v) { syncSettingsUI(); return; }
     settings[k] = v;
     saveSettings();
-    if (k === 'myLang' || k === 'showSource' || k === 'micType') {
+    if (k === 'showSource' || k === 'micType') {
       if (turn.dir) turn.cancel();
-      if (k === 'myLang') sessions.theirs.close();
-      else { sessions.mine.close(); sessions.theirs.close(); }
+      if (hf.active) hf.stop();
+      sessions.mine.close();
+      sessions.theirs.close();
       prefetch();
     }
     if (k === 'speakJa' || k === 'speakMine' || k === 'listenSpeak') {
       sessions.mine.applyVolume();
       sessions.theirs.applyVolume();
     }
-    if (k === 'showSource') ui.refillAll();
+    if (k === 'showSource' || k === 'trad') {
+      ui.refillAll();
+      phrasebook.render();
+    }
     if (k === 'idleMin') idle.bump();
     syncSettingsUI();
     ui.render();
@@ -1043,7 +1509,8 @@
     msgEl.textContent = '測試中…';
     msgEl.className = 'msgline';
     try {
-      await getSecret(settings.theirLang, settings.micType, { fresh: true });
+      const w = sessions.mine.wanted();
+      await getSecret(w.lang, w.micType, w.source, { fresh: true });
       msgEl.textContent = '✓ 可以用了：金鑰有效，也能使用口譯模型。';
       msgEl.className = 'msgline ok';
       return true;
@@ -1079,60 +1546,117 @@
   /* ---------- wiring ---------- */
   const sessions = { mine: new Session('mine'), theirs: new Session('theirs') };
 
-  function bind() {
-    $$('.talk').forEach((b) => b.addEventListener('click', () => turn.toggle(b.dataset.dir)));
-    $$('.mode').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
-
-    $('#status').addEventListener('click', () => {
-      const busy = [sessions.mine, sessions.theirs].some((s) => s.state !== 'idle');
-      if (busy) {
-        closeAll();
-        ui.toast('已斷線');
-      } else {
-        ui.toast('按「我說」或「對方說」就會自動連線');
+  // 我說／對方說: a tap listens until a pause; holding listens until the finger lifts.
+  function bindTalkButton(b) {
+    const dir = b.dataset.dir;
+    let press = null;
+    b.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      try { b.setPointerCapture(e.pointerId); } catch (x) { /* ignore */ }
+      if (turn.dir === dir) {
+        press = null;
+        turn.stop('manual');
+        return;
       }
+      press = { t: performance.now() };
+      turn.start(dir, { hold: true });
     });
+    const end = () => {
+      unlockAudio(); // pointerup counts as a user gesture on iOS
+      if (!press) return;
+      const held = performance.now() - press.t;
+      press = null;
+      if (held >= HOLD_MS) turn.release(dir);
+      else turn.tapped(dir);
+    };
+    b.addEventListener('pointerup', end);
+    b.addEventListener('pointercancel', end);
+    b.addEventListener('contextmenu', (e) => e.preventDefault());
+    b.addEventListener('click', (e) => { if (e.detail === 0) turn.toggle(dir); }); // keyboard
+  }
+
+  function bind() {
+    $$('.talk.mine, .talk.theirs').forEach(bindTalkButton);
+    $('.talk.listen').addEventListener('click', () => turn.toggle('listen'));
+    $('.talk.hf').addEventListener('click', () => hf.toggle());
+    $$('.mode').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+    $('#hangup').addEventListener('click', () => {
+      closeAll();
+      ui.toast('已斷線');
+    });
+    $('#typeBtn').addEventListener('click', () => typer.open());
+    $('#addPhrase').addEventListener('click', () => typer.open());
+    $('#hfBtn').addEventListener('click', () => setHandsFree(!settings.handsFree));
 
     $('#openSettings').addEventListener('click', () => ui.openSettings());
     $$('[data-close]').forEach((b) => b.addEventListener('click', () => ui.closeSheet(b.dataset.close)));
-    $('#settings').addEventListener('click', (e) => { if (e.target.id === 'settings') ui.closeSheet('settings'); });
+    ['settings', 'typer'].forEach((id) => {
+      $(`#${id}`).addEventListener('click', (e) => { if (e.target.id === id) ui.closeSheet(id); });
+    });
     $('#banner .banner-x').addEventListener('click', (e) => {
       e.stopPropagation();
       $('#banner').hidden = true;
       $('#banner').onclick = null;
     });
 
-    const introText = () => INTRO[settings.theirLang] || INTRO.ja;
-    const introZh = () => $('#introZh').textContent.trim();
     document.addEventListener('click', (e) => {
       const p = e.target.closest('[data-pair]');
       if (p) { setPair(p.dataset.pair); return; }
-      const x = e.target.closest('[data-intro]');
-      if (!x) return;
-      if (x.dataset.intro === 'say') speakText(introText(), settings.theirLang);
-      else big.show({ text: introText(), sub: introZh(), lang: settings.theirLang, reply: true });
-    });
-
-    $('#feed').addEventListener('click', (e) => {
-      const b = e.target.closest('button[data-act]');
-      if (!b) return;
-      const card = b.closest('.card');
-      const it = card && feed.items.find((x) => x.id === card.dataset.id);
-      if (!it) return;
-      if (b.dataset.act === 'zoom') {
-        big.show({ id: it.id, text: it.dst, sub: settings.showSource ? it.src : '', lang: it.to, reply: it.dir === 'mine' });
-      } else if (b.dataset.act === 'say') {
-        speakText(it.dst, it.to);
+      if (e.target.closest('[data-intro]')) {
+        big.show({ text: INTRO[settings.theirLang] || INTRO.ja, lang: settings.theirLang, sub: $('#introZh').textContent.trim(), subLang: 'zh', reply: true });
       }
     });
 
+    $('#feed').addEventListener('click', (e) => {
+      const card = e.target.closest('.card[data-id]');
+      if (!card) return;
+      const it = feed.items.find((x) => x.id === card.dataset.id);
+      if (!it || !it.dst) return;
+      if (e.target.closest('[data-act=say]')) speakText(it.dst, it.to);
+      else big.showItem(it);
+    });
+
+    $('#phraseList').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-act]');
+      const row = e.target.closest('.prow');
+      if (btn && row) phrasebook.act(row.dataset.key, btn.dataset.act);
+    });
+    $('#phraseCats').addEventListener('click', (e) => {
+      const chip = e.target.closest('[data-cat]');
+      if (!chip) return;
+      $$('#phraseCats .cat').forEach((c) => c.setAttribute('aria-pressed', String(c === chip)));
+      const head = $(`#psec-${chip.dataset.cat}`);
+      if (head) head.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    });
+
     $('#bigFlip').addEventListener('click', () => $('#big').classList.toggle('flipped'));
-    window.addEventListener('resize', () => { if (!$('#big').hidden) big.fit(); });
+    $('#bigSay').addEventListener('click', () => big.say());
     $('#bigClose').addEventListener('click', () => big.close());
     $('#bigReply').addEventListener('click', () => {
       big.close();
-      turn.start('theirs');
+      if (settings.mode !== 'talk') setMode('talk');
+      if (settings.handsFree) { if (!hf.active) hf.start(); } else turn.start('theirs');
     });
+    window.addEventListener('resize', () => { if (!$('#big').hidden) big.fit(); });
+
+    $('#typeGo').addEventListener('click', () => typer.go());
+    $('#typeInput').addEventListener('input', () => typer.autoDir());
+    $('#typeInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+        e.preventDefault();
+        typer.go();
+      }
+    });
+    $('#typeDir').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-v]');
+      if (!b) return;
+      typer.touched = true;
+      typer.setDir(b.dataset.v);
+    });
+    $('#typeBig').addEventListener('click', () => typer.showBig());
+    $('#typeSay').addEventListener('click', () => typer.say());
+    $('#typeSave').addEventListener('click', () => typer.save());
 
     $('#setupSave').addEventListener('click', async () => {
       if (await saveKey($('#setupKey'), $('#setupMsg'))) setTimeout(() => ui.closeSheet('setup'), 1200);
@@ -1179,7 +1703,7 @@
       }
     });
 
-    window.addEventListener('offline', () => ui.toast('沒有網路，翻譯暫時不能用'));
+    window.addEventListener('offline', () => ui.toast('沒有網路：翻譯暫時不能用，常用句還是可以用'));
     window.addEventListener('online', () => prefetch());
 
     let hiddenTimer = null;
@@ -1200,6 +1724,7 @@
     bind();
     syncSettingsUI();
     feed.init();
+    phrasebook.render();
     ui.render();
     if (!apiKey) ui.openSetup();
     else prefetch();
@@ -1207,7 +1732,7 @@
       navigator.serviceWorker.register('sw.js').catch(() => {});
     }
     // handle for debugging from the console
-    window.__ky = { VERSION, settings, sessions, turn, feed, usage, secretCache, diag };
+    window.__ky = { VERSION, settings, sessions, turn, hf, feed, usage, secretCache, diag, big, typer, phrasebook };
   }
 
   init();

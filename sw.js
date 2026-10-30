@@ -1,10 +1,12 @@
 /* 口譯 — offline cache for the app shell. API calls to OpenAI are never cached. */
-const CACHE = 'kouyaku-v1.1.0';
+const CACHE = 'kouyaku-v1.2.0';
 const SHELL = [
   './',
   'index.html',
   'styles.css',
   'app.js',
+  'phrases.js',
+  's2t.js',
   'manifest.webmanifest',
   'icon-192.png',
   'icon-512.png',

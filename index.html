@@ -21,12 +21,11 @@
 <body>
 <div class="app" id="app">
   <header class="bar">
-    <img class="brand-icon" src="icon-192.png" alt="口譯">
     <nav class="modes" aria-label="模式">
       <button type="button" class="mode" data-mode="talk" aria-pressed="true">對話</button>
       <button type="button" class="mode" data-mode="listen" aria-pressed="false">聆聽</button>
+      <button type="button" class="mode" data-mode="phrases" aria-pressed="false">常用句</button>
     </nav>
-    <button type="button" id="status" class="status" aria-live="polite">未連線</button>
     <button type="button" id="openSettings" class="iconbtn" aria-label="設定">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>
     </button>
@@ -39,49 +38,70 @@
 
   <main id="feed" class="feed">
     <section id="empty" class="empty">
-      <article class="card phrase">
-        <header class="card-head"><span class="who">先給對方看</span></header>
+      <article class="card phrase" data-intro="zoom">
+        <header class="card-head"><span class="who">先給對方看（點一下放大）</span></header>
         <p class="dst" lang="ja" id="introText">すみません、翻訳アプリを使っています。このスマホに向かって、ゆっくり話していただけますか。</p>
         <p class="src" id="introZh">不好意思，我在用翻譯 App，可以請你對著手機慢慢說嗎？</p>
-        <footer class="card-actions">
-          <button type="button" class="chip" data-intro="zoom">放大給對方看</button>
-          <button type="button" class="chip" data-intro="say">唸給對方聽</button>
-        </footer>
       </article>
       <ol class="howto">
         <li>下方切換語言：<b>中⇄日</b>、<b>中⇄英</b>、<b>英⇄日</b>。</li>
-        <li>按 <b>我說</b>：講<span data-myword>中文</span>，翻成<span data-theirword>日文</span>並唸出來。</li>
-        <li>按 <b>對方說</b>：對方講<span data-theirword>日文</span>，翻成<span data-myword>中文</span>。</li>
-        <li>講完停一下會自動停止，也可以再按一次停止。</li>
-        <li>閒置 <span data-idle>2</span> 分鐘自動斷線，不會一直計費。</li>
-        <li>聽導覽或廣播時切到 <b>聆聽</b>，會一直翻下去。</li>
+        <li><b>點一下</b>「我說」或「對方說」：講完會自動停。</li>
+        <li><b>按住</b>按鈕講話：放開就停，最準。</li>
+        <li>翻譯完日文會自動放大給對方看。</li>
+        <li><b>打字</b>：不方便講話時用。<b>免按鍵</b>：兩人直接輪流講（實驗）。</li>
+        <li><b>常用句</b>不用網路也能用。閒置 <span data-idle>2</span> 分鐘自動斷線。</li>
       </ol>
     </section>
   </main>
 
-  <div class="pairbar">
-    <div class="seg pairs" role="group" aria-label="語言組合">
-      <button type="button" data-pair="zh-ja">中⇄日</button>
-      <button type="button" data-pair="zh-en">中⇄英</button>
-      <button type="button" data-pair="en-ja">英⇄日</button>
+  <main id="phraseView" class="phrases" hidden>
+    <div class="cats" id="phraseCats"></div>
+    <div class="plist" id="phraseList"></div>
+  </main>
+
+  <footer class="dock">
+    <div class="statusline" id="statusLine" hidden>
+      <span class="dot" aria-hidden="true"></span><span id="statusText">已連線</span>
+      <button type="button" id="hangup" class="linkbtn">斷線</button>
     </div>
-    <button type="button" class="intro" id="introChip" data-intro="zoom">請對方慢慢說</button>
-  </div>
 
-  <footer id="talkControls" class="controls">
-    <button type="button" class="talk mine" data-dir="mine" aria-pressed="false">
-      <span class="t1">我說</span><span class="t2" data-label="mine">中文 → 日本語</span><span class="hint"></span><span class="lvl"><i></i></span>
-    </button>
-    <button type="button" class="talk theirs" data-dir="theirs" aria-pressed="false">
-      <span class="t1">對方說</span><span class="t2" data-label="theirs">日本語 → 中文</span><span class="hint"></span><span class="lvl"><i></i></span>
-    </button>
-  </footer>
+    <div class="pairbar">
+      <div class="seg pairs" role="group" aria-label="語言組合">
+        <button type="button" data-pair="zh-ja">中⇄日</button>
+        <button type="button" data-pair="zh-en">中⇄英</button>
+        <button type="button" data-pair="en-ja">英⇄日</button>
+      </div>
+      <div class="tools">
+        <button type="button" class="tool" id="typeBtn">打字</button>
+        <button type="button" class="tool" id="hfBtn" aria-pressed="false">免按鍵</button>
+      </div>
+    </div>
 
-  <footer id="listenControls" class="controls" hidden>
-    <label class="switch listen-switch"><span>唸出翻譯（建議戴耳機）</span><input type="checkbox" id="listenSpeak"></label>
-    <button type="button" class="talk listen" data-dir="listen" aria-pressed="false">
-      <span class="t1">開始聆聽</span><span class="t2" data-label="listen">日本語 → English</span><span class="hint"></span><span class="lvl"><i></i></span>
-    </button>
+    <div id="talkControls" class="controls">
+      <button type="button" class="talk mine" data-dir="mine" aria-pressed="false">
+        <span class="t1">我說</span><span class="t2" data-label="mine">中文 → 日本語</span><span class="hint"></span><span class="lvl"><i></i></span>
+      </button>
+      <button type="button" class="talk theirs" data-dir="theirs" aria-pressed="false">
+        <span class="t1">對方說</span><span class="t2" data-label="theirs">日本語 → 中文</span><span class="hint"></span><span class="lvl"><i></i></span>
+      </button>
+    </div>
+
+    <div id="hfControls" class="controls" hidden>
+      <button type="button" class="talk hf" data-dir="hf" aria-pressed="false">
+        <span class="t1">免按鍵</span><span class="t2" data-label="hf">中文 ⇄ 日本語</span><span class="hint"></span><span class="lvl"><i></i></span>
+      </button>
+    </div>
+
+    <div id="listenControls" class="controls" hidden>
+      <label class="switch listen-switch"><span>唸出翻譯（建議戴耳機）</span><input type="checkbox" id="listenSpeak"></label>
+      <button type="button" class="talk listen" data-dir="listen" aria-pressed="false">
+        <span class="t1">開始聆聽</span><span class="t2" data-label="listen">日本語 → 中文</span><span class="hint"></span><span class="lvl"><i></i></span>
+      </button>
+    </div>
+
+    <div id="phraseControls" class="controls" hidden>
+      <button type="button" class="btn wide addbtn" id="addPhrase">＋ 新增我的句子</button>
+    </div>
   </footer>
 </div>
 
@@ -93,9 +113,31 @@
     <p class="big-sub" id="bigSub"></p>
   </div>
   <div class="big-actions">
-    <button type="button" id="bigFlip">翻轉 180°</button>
+    <button type="button" id="bigFlip">翻轉</button>
+    <button type="button" id="bigSay">唸出來</button>
     <button type="button" id="bigReply" class="primary">換對方說</button>
     <button type="button" id="bigClose">關閉</button>
+  </div>
+</div>
+
+<div id="typer" class="sheet" role="dialog" aria-modal="true" aria-labelledby="typerTitle" hidden>
+  <div class="sheet-body">
+    <div class="sheet-head"><h2 id="typerTitle">打字翻譯</h2><button type="button" class="btn ghost" data-close="typer">關閉</button></div>
+    <textarea id="typeInput" rows="3" placeholder="輸入要說的話…" autocomplete="off"></textarea>
+    <div class="seg" id="typeDir" role="group" aria-label="翻譯方向">
+      <button type="button" data-v="out" aria-pressed="true">翻成日文</button>
+      <button type="button" data-v="in" aria-pressed="false">翻成中文</button>
+    </div>
+    <button type="button" id="typeGo" class="btn wide">翻譯</button>
+    <p id="typeMsg" class="msgline" role="status"></p>
+    <div id="typeResult" class="tresult" hidden>
+      <p class="tres-text" id="typeOut"></p>
+      <div class="row">
+        <button type="button" class="btn" id="typeBig">放大給對方看</button>
+        <button type="button" class="btn ghost" id="typeSay">唸出來</button>
+      </div>
+      <button type="button" class="btn ghost wide" id="typeSave">☆ 存成常用句</button>
+    </div>
   </div>
 </div>
 
@@ -138,22 +180,28 @@
         <button type="button" data-pair="zh-en">中文⇄英文</button>
         <button type="button" data-pair="en-ja">英文⇄日文</button>
       </div>
-      <p class="muted small">左邊是我的語言，右邊是對方的語言。「我說」翻成對方的語言，「對方說」翻成我的語言。講話的語言會自動辨認，中英混著講也可以。中文字幕會先試繁體，OpenAI 不接受時改用一般中文（可能是簡體字）。</p>
+      <p class="muted small">左邊是我的語言，右邊是對方的語言。講話的語言會自動辨認，中英混著講也可以。</p>
     </div>
 
-    <h3>聲音與字幕</h3>
+    <h3>顯示</h3>
     <div class="group">
-      <label class="switch"><span>唸出日文翻譯（給對方聽）</span><input type="checkbox" data-setting="speakJa"></label>
-      <label class="switch"><span>唸出對方的翻譯（給我聽）</span><input type="checkbox" data-setting="speakMine"></label>
+      <label class="switch"><span>翻完自動放大給對方看</span><input type="checkbox" data-setting="autoBig"></label>
+      <label class="switch"><span>中文一律用繁體字</span><input type="checkbox" data-setting="trad"></label>
       <label class="switch"><span>顯示原文字幕</span><input type="checkbox" data-setting="showSource"></label>
-      <p class="muted small">原文字幕用另一個模型（gpt-realtime-whisper），可能另計約 US$0.017／分鐘。</p>
+      <p class="muted small">原文字幕用另一個模型（gpt-realtime-whisper），可能另計約 US$0.017／分鐘。它也幫忙判斷「講完了沒」，建議開著。</p>
+    </div>
+
+    <h3>聲音</h3>
+    <div class="group">
+      <label class="switch"><span>唸出給對方的翻譯</span><input type="checkbox" data-setting="speakJa"></label>
+      <label class="switch"><span>唸出給我的翻譯</span><input type="checkbox" data-setting="speakMine"></label>
     </div>
 
     <h3>收音</h3>
     <div class="group">
       <div class="seg" data-setting="micType"><button type="button" data-v="near_field">手機拿近講</button><button type="button" data-v="far_field">手機放桌上</button></div>
-      <p class="muted small">講完停頓多久自動停止</p>
-      <div class="seg" data-setting="silenceMs"><button type="button" data-v="900">0.9 秒</button><button type="button" data-v="1200">1.2 秒</button><button type="button" data-v="1800">1.8 秒</button></div>
+      <p class="muted small">點一下開始時，講完停頓多久自動停止（按住講話則是放開就停）</p>
+      <div class="seg" data-setting="silenceMs"><button type="button" data-v="1000">1 秒</button><button type="button" data-v="1500">1.5 秒</button><button type="button" data-v="2200">2.2 秒</button></div>
     </div>
 
     <h3>費用</h3>
@@ -173,9 +221,12 @@
       <button type="button" id="diagCopy" class="btn ghost">複製診斷資訊</button>
     </div>
     <p class="muted small center" id="versionLine"></p>
+    <p class="muted small center">繁簡轉換字典：OpenCC（Apache License 2.0）</p>
   </div>
 </div>
 
+<script src="s2t.js"></script>
+<script src="phrases.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
